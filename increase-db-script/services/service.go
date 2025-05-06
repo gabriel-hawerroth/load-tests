@@ -78,12 +78,19 @@ func (s *Service) Process() {
 			done = false
 		}
 
+		var releaseType models.ReleaseType
+		if i%2 == 0 {
+			releaseType = models.ReleaseTypeE
+		} else {
+			releaseType = models.ReleaseTypeR
+		}
+
 		release := models.Release{
 			UserID:              int64(s.UserID),
 			Description:         &description,
 			AccountID:           &accountID,
 			Amount:              amount,
-			Type:                models.ReleaseTypeE, // Exemplo, pode variar (E, R, T)
+			Type:                releaseType, // Varied release type
 			Done:                done,
 			CategoryID:          &categoryID,
 			Date:                randomDate,
