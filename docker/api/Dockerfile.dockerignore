@@ -1,0 +1,11 @@
+# dockerignore específico deste Dockerfile (BuildKit lê <dockerfile>.dockerignore).
+# Sem isto o contexto de build carregaria o target/ inteiro do backend.
+target/
+.git/
+.github/
+.idea/
+.settings/
+.mvn/wrapper/*.jar
+docs/
+node_modules/
+*.log

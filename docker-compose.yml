@@ -1,0 +1,206 @@
+name: finax-loadtest
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Réplica da VM de produção (Oracle Cloud, 2 OCPU · 12GB) em containers.
+#
+# O isolamento de CPU é feito por *cpuset compartilhado*: nginx, JVM e Postgres
+# recebem o MESMO par de cores (CPUSET_SUT). Isso reproduz o que a VM realmente
+# é — três processos disputando 2 cores, sem cota separada — em vez de dar uma
+# fatia garantida a cada um, que é o que `cpus:` faria.
+#
+# O k6 roda fora desse par (CPUSET_LOAD), senão o gerador de carga competiria
+# com o sistema sob teste e o resultado mediria a máquina, não a API.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-sut-common: &sut-common
+  cpuset: "${CPUSET_SUT:-0,1}"
+  networks: [finax]
+  environment:
+    TZ: America/Sao_Paulo
+  # O padrão do Docker (1024) é menor que o de qualquer VM Linux e viraria o
+  # gargalo antes da CPU: nginx avisa "worker_connections exceed open file
+  # resource limit" e a JVM começa a recusar conexão sob carga.
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  restart: unless-stopped
+
+services:
+  postgres:
+    <<: *sut-common
+    image: postgres:18-alpine
+    mem_limit: ${PG_MEM:-5g}
+    shm_size: ${PG_SHM:-256m}
+    environment:
+      TZ: America/Sao_Paulo
+      POSTGRES_DB: ${DB_NAME:-finax}
+      POSTGRES_USER: ${DB_USER:-finax}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-finax}
+    command:
+      - postgres
+      # pg_stat_statements é a única coisa aqui que produção não tem: sem ele não
+      # há como responder "qual query segurou a conexão" depois do teste.
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-100}
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-128MB}
+      - -c
+      - log_min_duration_statement=${PG_LOG_MIN_DURATION:-1000}
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-finax} -d ${DB_NAME:-finax}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "${PG_HOST_PORT:-55432}:5432"
+
+  api:
+    <<: *sut-common
+    build:
+      context: ../finax-backend
+      dockerfile: ../load-tests/docker/api/Dockerfile
+    image: finax-loadtest/api:local
+    mem_limit: ${API_MEM:-4g}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TZ: America/Sao_Paulo
+      SPRING_PROFILES_ACTIVE: prod,loadtest
+      SPRING_CONFIG_ADDITIONAL_LOCATION: /config/
+      # Mesmas flags do pm2 em produção. A única adição é ActiveProcessorCount:
+      # na VM a JVM já enxerga 2 cores; aqui o limite é o cpuset, que ela ignora.
+      JAVA_OPTS: >-
+        -XX:+UseG1GC
+        -XX:+UseCompactObjectHeaders
+        -Xms${JAVA_XMS:-2g} -Xmx${JAVA_XMX:-2g}
+        -XX:+AlwaysPreTouch
+        -XX:MaxMetaspaceSize=${JAVA_MAX_METASPACE:-384m}
+        -XX:+ExitOnOutOfMemoryError
+        -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/logs/
+        ${JFR_OPTS--XX:StartFlightRecording=name=finax,maxsize=256m,maxage=12h,dumponexit=true,filename=/logs/finax.jfr}
+        -XX:ActiveProcessorCount=${JAVA_PROCESSORS:-2}
+        -Duser.timezone=America/Sao_Paulo
+        ${JAVA_EXTRA_OPTS:-}
+      FINAX_DATABASE: postgres:5432/${DB_NAME:-finax}
+      FINAX_DATABASE_USERNAME: ${DB_USER:-finax}
+      FINAX_DATABASE_PASSWORD: ${DB_PASSWORD:-finax}
+      FINAX_SECRET_TOKEN: ${JWT_SECRET:-loadtest-secret-token}
+      # Credenciais falsas de propósito: os hosts externos estão em buraco negro
+      # (extra_hosts abaixo), nenhuma chamada sai da máquina.
+      AWS_IAM_ACCESS_KEY: loadtest
+      AWS_IAM_SECRET_KEY: loadtest
+      # O SDK da AWS tem retry próprio (3 tentativas), independente do Spring Retry:
+      # sem isto, cada cadastro gastaria três tentativas de conexão recusada.
+      AWS_MAX_ATTEMPTS: 1
+      AWS_RETRY_MODE: standard
+      HUNTER_IO_API_KEY: loadtest
+      GOOGLE_CLIENT_ID: loadtest
+      LT_RATE_LIMIT: ${LT_RATE_LIMIT:-false}
+      LT_COOKIE_SECURE: ${LT_COOKIE_SECURE:-true}
+      LT_EMAIL_RETRY_ATTEMPTS: ${LT_EMAIL_RETRY_ATTEMPTS:-1}
+    # Buraco negro para os serviços externos: a conexão é recusada na hora, em vez
+    # de pendurar a thread até o timeout. HunterIoService trata a exceção como
+    # "e-mail entregável" e o envio SES morre no listener @Async — nenhum byte sai.
+    extra_hosts:
+      - "api.hunter.io:127.0.0.1"
+      - "email.sa-east-1.amazonaws.com:127.0.0.1"
+      - "s3.sa-east-1.amazonaws.com:127.0.0.1"
+      - "${AWS_S3_BUCKET:-finax}.s3.sa-east-1.amazonaws.com:127.0.0.1"
+      - "oauth2.googleapis.com:127.0.0.1"
+      - "www.googleapis.com:127.0.0.1"
+    volumes:
+      - ./docker/api/config:/config:ro
+      # JFR e heap dump, iguais a /home/ubuntu/logs na VM. Volume nomeado em vez de
+      # bind mount porque o processo roda como uid 1001 e não é dono de ./results.
+      - jvmlogs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/auth/timezone || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    ports:
+      - "${API_HOST_PORT:-58080}:8080"
+
+  nginx:
+    <<: *sut-common
+    image: nginx:1.29-alpine
+    mem_limit: ${NGINX_MEM:-256m}
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/snippets:/etc/nginx/snippets:ro
+      - ./docker/nginx/sites/${NGINX_SITE:-api.conf}:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/nginx/tls:/etc/nginx/tls:ro
+      - ./results/nginx:/var/log/nginx
+    # nginx só escuta IPv4; `localhost` no Alpine resolve ::1 primeiro e o healthcheck
+    # falharia por conexão recusada com o serviço no ar.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/auth/timezone || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "${HTTP_HOST_PORT:-58081}:80"
+      - "${HTTPS_HOST_PORT:-58443}:443"
+
+  k6:
+    image: grafana/k6:latest
+    # Fora do cpuset do sistema sob teste — o gerador não pode roubar CPU de quem
+    # está sendo medido.
+    cpuset: "${CPUSET_LOAD:-2-15}"
+    networks: [finax]
+    profiles: ["tools"]
+    entrypoint: ["k6"]
+    # A imagem do k6 roda com um uid próprio e não conseguiria escrever em ./results
+    # (bind mount preserva o dono do host). run.sh exporta o uid/gid reais.
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    environment:
+      TZ: America/Sao_Paulo
+      BASE_URL: ${BASE_URL:-https://nginx}
+      JWT_SECRET: ${JWT_SECRET:-loadtest-secret-token}
+      PROFILE: ${PROFILE:-baseline}
+      RUN_ID: ${RUN_ID:-manual}
+      VUS: ${VUS:-}
+      DURATION: ${DURATION:-}
+      SIGNUP_RATE: ${SIGNUP_RATE:-}
+      WRITE_RATIO: ${WRITE_RATIO:-}
+      RELEASES_PER_MONTH: ${RELEASES_PER_MONTH:-}
+      HISTORY_MONTHS: ${HISTORY_MONTHS:-}
+      RELEASES_PER_USER: ${RELEASES_PER_USER:-}
+      THINK_TIME_MIN: ${THINK_TIME_MIN:-}
+      THINK_TIME_MAX: ${THINK_TIME_MAX:-}
+      SEED_USERS: ${SEED_USERS:-}
+      SEED_VUS: ${SEED_VUS:-}
+      USE_SEED: ${USE_SEED:-}
+      CAPACITY_STEPS: ${CAPACITY_STEPS:-}
+      CAPACITY_STEP_MINUTES: ${CAPACITY_STEP_MINUTES:-}
+      # Dashboard nativo do k6: ao vivo em http://localhost:5665 durante a execução e
+      # exportado como HTML estático no fim (séries por segundo, que o summary não tem).
+      K6_WEB_DASHBOARD: ${K6_WEB_DASHBOARD:-true}
+      K6_WEB_DASHBOARD_EXPORT: /results/${RUN_ID:-manual}/k6-report.html
+      K6_WEB_DASHBOARD_PERIOD: ${K6_WEB_DASHBOARD_PERIOD:-2s}
+    ports:
+      - "${K6_DASHBOARD_PORT:-5665}:5665"
+    volumes:
+      - ./k6:/k6:ro
+      - ./results:/results
+
+networks:
+  finax:
+    driver: bridge
+
+volumes:
+  pgdata:
+  jvmlogs:

@@ -1,1 +1,5 @@
+.env
+results/
+docker/nginx/tls/
 finax-backend
+__pycache__/
